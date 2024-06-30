@@ -252,11 +252,25 @@ class LatentAttentionBlock(nn.Module):
         # Has a high lr mult applied to it so that each layer can learn its own attention scale.
         self.position_bias_mult = nn.Parameter(torch.tensor(1., device='cuda'))
 
-    def forward(self, x):
+    def make_mask(self, x, first_planning_token_idx: int | None = None):
+        seq_len = x.shape[1]
+        attn_mask = torch.where(
+            causal_mask[:seq_len, :seq_len], 
+            F.softplus(self.position_bias_mult) * position_bias_base[:seq_len, :seq_len], 
+            negative_infinity_matrix_base[:seq_len, :seq_len]
+        )
+        if first_planning_token_idx is not None:
+            first_planning_token_idx = None if first_planning_token_idx >= seq_len else first_planning_token_idx
+            attn_mask[:, first_planning_token_idx:] = (
+                F.softplus(self.position_bias_mult) 
+                * position_bias_base[:seq_len, first_planning_token_idx:seq_len]
+            )
+        return attn_mask
+
+    def forward(self, x, first_planning_token_idx: int | None = None):
         residual = x
 
-        # Make additive attention mask, scaled by a learned mult for the position bias (lets us learn dynamic attention ranges per layer as needed)
-        attn_mask = torch.where(causal_mask[:x.shape[1], :x.shape[1]], F.softplus(self.position_bias_mult) * position_bias_base[:x.shape[1], :x.shape[1]], negative_infinity_matrix_base[:x.shape[1], :x.shape[1]])
+        attn_mask = self.make_mask(x, first_planning_token_idx)
         # Shared LayerNorm for linear layers and attention
         x = self.norm(x)
 
@@ -377,7 +391,7 @@ def get_planning_data(
         dtype=torch.long,
     ).copy_(sequence)  # copy sequence to not have negative downstream effects
 
-    mask_width = max(1, math.floor(masking_rate * sequence.shape[-1]))
+    mask_width = max(2, math.floor(masking_rate * sequence.shape[-1]))  # at minimum 2 --> 1 for planning, 1 for acting
     inputs = sequence.roll(1, dims=-1)
     inputs [:, -mask_width:] = hyp['misc']['mask_token']
     inputs[:, 0] = hyp['misc']['planning_token']
@@ -443,6 +457,12 @@ def randomize_with_mean(
         value = mean
 
     return max(1 if round else 1.0, value)
+
+
+def randomize_masking_rate(mean: float, concentration: int = 8) -> float:
+    alpha = mean * concentration
+    beta = (1 - mean) * concentration
+    return torch.distributions.Beta(alpha, beta).sample()
 
 
 # Make loss function
@@ -603,6 +623,9 @@ def eval(net: SpeedyLangNet):
             val_loss += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
             val_acc  += 1./num_eval_steps * (outputs.argmax(-1) == targets).float().mean()
 
+            # TODO: Test on different masking-rate-combinations
+            #   ((0.25, 0.1), (0.5, 0.1), (0.75, 0.1), (0.25, 0.0), (0.5, 0.0), (0.75, 0.0)) etc.
+            #   The 0.0 for the acting_rate means that a single token is acted upon.
             inputs, targets = get_planning_data(sequence, masking_rate=0.25)
             outputs = net(inputs)
             val_loss_planning += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
@@ -739,15 +762,23 @@ def train(net: SpeedyLangNet | None = None, **settings):
         sequence = get_batch(data, key='train', batchsize=curr_batchsize, length=curr_length)
 
         if settings['plan_act']:
-            inputs, targets = get_planning_data(sequence, masking_rate=settings['planner_masking_rate'])
+            planner_masking_rate = settings['planner_masking_rate']
+            actor_masking_rate = settings['actor_masking_rate']
+
+            if settings['randomize_masking_rates']:
+                planner_masking_rate = randomize_masking_rate(planner_masking_rate)
+                actor_masking_rate = randomize_masking_rate(actor_masking_rate)
+            actor_masking_rate = min(actor_masking_rate, planner_masking_rate - (1.1/curr_length))  # at least 1 token less than the planner
+
+            inputs, targets = get_planning_data(sequence, masking_rate=planner_masking_rate)
             outputs = net(inputs,)
             loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["planning_divider"]
             loss.div(discrete_sampled_microbatch_steps).backward(retain_graph=True)
 
             inputs, targets = get_acting_data(
                 net, sequence, outputs,
-                planning_rate=settings['planner_masking_rate'],
-                acting_rate=settings['actor_masking_rate'],
+                planning_rate=planner_masking_rate,
+                acting_rate=actor_masking_rate,
                 top_k=settings['top_k'],
             )
             outputs = net(inputs)
@@ -1083,6 +1114,13 @@ def get_args() -> argparse.Namespace:
         help="Masking rate for the acting task. TYPE: float; DEFAULT: 0.1"
     )
     parser.add_argument(
+        "--randomize_masking_rates",
+        action="store_true",
+        help="If this flag is set, the masking rates will be randomized "
+        "using a Beta-distribution with concentration=8 around the given masking rates. "
+        "FLAG"
+    )
+    parser.add_argument(
         "--top_k",
         type=int, default=5,
         help="Top-k for the acting task. TYPE: int; DEFAULT: 5"
@@ -1275,6 +1313,7 @@ def main():
                 causal_divider=causal_divider,
                 planning_divider=planning_divider,
                 acting_divider=acting_divider,
+                randomize_masking_rate=args.randomize_masking_rate,
                 top_k=args.top_k,
             )
 
@@ -1289,6 +1328,7 @@ def main():
                 "causal_divider": [causal_divider],
                 "planning_divider": [planning_divider],
                 "acting_divider": [acting_divider],
+                "randomize_masking_rate": [args.randomize_masking_rate],
                 "top_k": [args.top_k],
                 "randomize_denoiser_settings": [args.randomize_denoiser_settings],
                 "randomize_mask_width": [args.randomize_mask_width],
