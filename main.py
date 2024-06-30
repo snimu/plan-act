@@ -252,25 +252,38 @@ class LatentAttentionBlock(nn.Module):
         # Has a high lr mult applied to it so that each layer can learn its own attention scale.
         self.position_bias_mult = nn.Parameter(torch.tensor(1., device='cuda'))
 
-    def make_mask(self, x, first_planning_token_idx: int | None = None):
+    def make_mask(
+            self, 
+            x, 
+            first_acting_token_idx: int | None = None,
+            last_acting_token_idx: int | None = None,
+    ):
         seq_len = x.shape[1]
         attn_mask = torch.where(
             causal_mask[:seq_len, :seq_len], 
             F.softplus(self.position_bias_mult) * position_bias_base[:seq_len, :seq_len], 
             negative_infinity_matrix_base[:seq_len, :seq_len]
         )
-        if first_planning_token_idx is not None:
-            first_planning_token_idx = None if first_planning_token_idx >= seq_len else first_planning_token_idx
-            attn_mask[:, first_planning_token_idx:] = (
+        if first_acting_token_idx is not None:
+            assert last_acting_token_idx is not None
+            assert last_acting_token_idx > first_acting_token_idx
+            first_acting_token_idx = None if first_acting_token_idx >= seq_len else first_acting_token_idx
+            last_acting_token_idx = None if last_acting_token_idx >= seq_len else last_acting_token_idx
+            attn_mask[first_acting_token_idx:, last_acting_token_idx:] = (
                 F.softplus(self.position_bias_mult) 
-                * position_bias_base[:seq_len, first_planning_token_idx:seq_len]
+                * position_bias_base[first_acting_token_idx:seq_len, last_acting_token_idx:seq_len]
             )
         return attn_mask
 
-    def forward(self, x, first_planning_token_idx: int | None = None):
+    def forward(
+            self, 
+            x, 
+            first_acting_token_idx: int | None = None,
+            last_acting_token_idx: int | None = None,
+    ):
         residual = x
 
-        attn_mask = self.make_mask(x, first_planning_token_idx)
+        attn_mask = self.make_mask(x, first_acting_token_idx, last_acting_token_idx)
         # Shared LayerNorm for linear layers and attention
         x = self.norm(x)
 
@@ -383,7 +396,7 @@ def get_causal_data(sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
 @torch.no_grad()
 def get_planning_data(
         sequence: torch.Tensor,
-        masking_rate: float = 0.5,
+        first_acting_token_idx: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     targets = torch.zeros_like(
         sequence, 
@@ -391,9 +404,8 @@ def get_planning_data(
         dtype=torch.long,
     ).copy_(sequence)  # copy sequence to not have negative downstream effects
 
-    mask_width = max(2, math.floor(masking_rate * sequence.shape[-1]))  # at minimum 2 --> 1 for planning, 1 for acting
     inputs = sequence.roll(1, dims=-1)
-    inputs [:, -mask_width:] = hyp['misc']['mask_token']
+    inputs [:, first_acting_token_idx:] = hyp['misc']['mask_token']
     inputs[:, 0] = hyp['misc']['planning_token']
 
     return inputs, targets
@@ -404,8 +416,8 @@ def get_acting_data(
         net: SpeedyLangNet,
         sequence: torch.Tensor,
         planning_output: torch.Tensor,
-        planning_rate: float = 0.5,
-        acting_rate: float = 0.1,
+        first_acting_token_idx: int,
+        last_acting_token_idx: int,
         top_k: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     targets = torch.zeros_like(
@@ -414,14 +426,9 @@ def get_acting_data(
         dtype=torch.long,
     ).copy_(sequence)
 
-    planning_width = max(1, math.floor(planning_rate * sequence.shape[-1]))
-    acting_width = max(1, math.floor(acting_rate * sequence.shape[-1]))
-
-    assert planning_width > acting_width
-
     inputs = sequence.roll(1, dims=-1)
-    inputs[:, -planning_width+acting_width:] = recombine_outputs(net, planning_output[:, -planning_width:], top_k)
-    inputs[:, -planning_width:-planning_width+acting_width] = hyp['misc']['acting_token']
+    inputs[:, last_acting_token_idx:] = recombine_outputs(net, planning_output[:, last_acting_token_idx:], top_k)
+    inputs[:, first_acting_token_idx:last_acting_token_idx] = hyp['misc']['acting_token']
     inputs[:, 0] = hyp['misc']['acting_token']
 
     return inputs, targets
@@ -436,33 +443,20 @@ def recombine_outputs(net: SpeedyLangNet, planning_output: torch.Tensor, top_k: 
     return embeddings
 
 
-def randomize_with_mean(
-        mean: int,
-        distribution: Literal["gaussian", "uniform", "noop"],
-        round: bool = True,
-) -> int | float:
-    if distribution == "gaussian":
-        bias = mean
-        scale = bias / 4
-        x = torch.randn(1000) * scale + bias
-        x = torch.clamp(x, 0, mean*2)
-        value = int(x.round()[torch.randint(0, 1000, (1,))]) if round else float(x[torch.randint(0, 1000, (1,))])
-    elif distribution == "uniform":
-        bias = mean / 2
-        scale = mean
-        x = torch.rand(1000) * scale + bias
-        x = torch.clamp(x, 0, scale + bias)
-        value = int(x.round()[torch.randint(0, 1000, (1,))]) if round else float(x[torch.randint(0, 1000, (1,))])
-    else:
-        value = mean
-
-    return max(1 if round else 1.0, value)
-
-
 def randomize_masking_rate(mean: float, concentration: int = 8) -> float:
     alpha = mean * concentration
     beta = (1 - mean) * concentration
     return torch.distributions.Beta(alpha, beta).sample()
+
+
+def get_first_and_last_acting_token_idx(seq_len: int, planning_rate: float, acting_rate: float):
+    planning_width = max(2, math.floor(planning_rate * seq_len))
+    acting_width = max(1, math.floor(acting_rate * seq_len))
+
+    first_acting_token_idx = seq_len - planning_width
+    last_acting_token_idx = first_acting_token_idx + acting_width
+
+    return first_acting_token_idx, last_acting_token_idx
 
 
 # Make loss function
@@ -598,51 +592,227 @@ def calc_pplx(loss: torch.Tensor | float) -> torch.Tensor | float:
     return 2.71828 ** loss
 
 
-def eval(net: SpeedyLangNet):
-    ####################
-    # Evaluation  Mode #
-    ####################
+@torch.no_grad()
+def _eval_causal(
+        net: SpeedyLangNet,
+        eval_batchsize: int,
+        num_eval_steps: int,
+):
+    # float32 here to prevent truncation errors
+    val_loss, val_acc = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
+    
+    for _ in range(num_eval_steps):
+        sequence = get_batch(data, key='eval', batchsize=eval_batchsize, length=hyp['misc']['sequence_length']['max'])
 
-    # Do a slightly noisy fast eval over the max sequence length (should work okay as a rough general measurement of how we're doing)
-    # Note that this is an approximation, it doesn't even necessarily use all of the requested tokens (but gets close because of the floor operation.)
+        inputs, targets = get_causal_data(sequence)
+        outputs = net(inputs)
+        val_loss += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
+        val_acc  += 1./num_eval_steps * (outputs.argmax(-1) == targets).float().mean()
+
+    val_pplx = calc_pplx(val_loss)
+    return val_loss.item(), val_acc.item(), val_pplx.item()
+
+
+@torch.no_grad()
+def _eval_plan_act(
+        net: SpeedyLangNet,
+        eval_batchsize: int,
+        num_eval_steps: int,
+        first_acting_token_idx: int,
+        last_acting_token_idx: int,
+        top_k: int,
+):
+    val_loss_planning, val_acc_planning = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
+    val_loss_acting_full, val_acc_acting_full = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
+    val_loss_acting_causal, val_acc_acting_causal = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
+    val_loss_acting_acting, val_acc_acting_acting = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
+    val_loss_acting_planning, val_acc_acting_planning = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
+
+    for _ in range(num_eval_steps):
+        sequence = get_batch(data, key='eval', batchsize=eval_batchsize, length=hyp['misc']['sequence_length']['max'])
+
+        inputs, targets = get_planning_data(sequence, first_acting_token_idx)
+        outputs = net(inputs)
+        val_loss_planning += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
+        val_acc_planning += 1./num_eval_steps * (outputs.argmax(-1) == targets).float().mean()
+
+        inputs, targets = get_acting_data(
+            net=net,
+            sequence=sequence,
+            planning_output=outputs,
+            first_acting_token_idx=first_acting_token_idx,
+            last_acting_token_idx=last_acting_token_idx,
+            top_k=top_k,
+        )
+        outputs = net(
+            inputs, 
+            first_acting_token_idx=first_acting_token_idx,
+            last_acting_token_idx=last_acting_token_idx,    
+        )
+        val_loss_acting_full += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
+        val_acc_acting_full += 1./num_eval_steps * (outputs.argmax(-1) == targets).float().mean()
+        val_loss_acting_causal += 1./num_eval_steps * loss_fn(
+            outputs[:, :first_acting_token_idx].flatten(0, 1).float(), 
+            targets[:, :first_acting_token_idx].flatten(0, 1),
+        )
+        val_acc_acting_causal += 1./num_eval_steps * (
+            outputs[:, :first_acting_token_idx].argmax(-1) 
+            == targets[:, :first_acting_token_idx]
+        ).float().mean()
+        val_loss_acting_acting += 1./num_eval_steps * loss_fn(
+            outputs[:, first_acting_token_idx:last_acting_token_idx].flatten(0, 1).float(), 
+            targets[:, first_acting_token_idx:last_acting_token_idx].flatten(0, 1),
+        )
+        val_acc_acting_acting += 1./num_eval_steps * (
+            outputs[:, first_acting_token_idx:last_acting_token_idx].argmax(-1) 
+            == targets[:, first_acting_token_idx:last_acting_token_idx]
+        ).float().mean()
+        val_loss_acting_planning += 1./num_eval_steps * loss_fn(
+            outputs.flatten(0, 1)[:, last_acting_token_idx:].float(), 
+            targets.flatten(0, 1)[:, last_acting_token_idx:],
+        )
+        val_acc_acting_planning += 1./num_eval_steps * (
+            outputs.argmax(-1)[:, last_acting_token_idx:]
+            == targets[:, last_acting_token_idx:]
+        ).float().mean()
+
+    val_pplx_planning = calc_pplx(val_loss_planning)
+    val_pplx_acting_full = calc_pplx(val_loss_acting_full)
+    val_pplx_acting_causal = calc_pplx(val_loss_acting_causal)
+    val_pplx_acting_acting = calc_pplx(val_loss_acting_acting)
+    val_pplx_acting_planning = calc_pplx(val_loss_acting_planning)
+
+    return (
+        val_loss_planning, val_acc_planning, val_pplx_planning,
+        val_loss_acting_full, val_acc_acting_full, val_pplx_acting_full,
+        val_loss_acting_causal, val_acc_acting_causal, val_pplx_acting_causal,
+        val_loss_acting_acting, val_acc_acting_acting, val_pplx_acting_acting,
+        val_loss_acting_planning, val_acc_acting_planning, val_pplx_acting_planning,
+    )
+
+
+@torch.no_grad()
+def quick_evaluation(net: SpeedyLangNet):
+    net.eval()
+    
     eval_batchsize           = max(math.floor(tokens_per_batch_capacity/(hyp['misc']['sequence_length']['max'])//16), 1) # Number of sequences per batch relative to the max-length batchsize capacity, downscale factor hardcoded to help prevent OOMs. Tunable
     num_eval_sequences       = hyp['opt']['num_eval_tokens']//hyp['misc']['sequence_length']['max']
     num_eval_steps           = num_eval_sequences//eval_batchsize
 
-    # float32 here to prevent truncation errors
-    val_loss, val_acc = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float), torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
-    val_loss_planning = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
-    val_loss_acting = torch.tensor(0., device=hyp['misc']['device'], dtype=torch.float)
-    with torch.no_grad():
-        # Note: We eval at the maximum sequence length so that we can get an idea of how well the sequence length growing extrapolates out
-        for _ in range(num_eval_steps):
-            sequence = get_batch(data, key='eval', batchsize=eval_batchsize, length=hyp['misc']['sequence_length']['max'])
-            
-            inputs, targets = get_causal_data(sequence)
-            outputs = net(inputs)
-            val_loss += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
-            val_acc  += 1./num_eval_steps * (outputs.argmax(-1) == targets).float().mean()
+    causal_loss, causal_acc, causal_pplx = _eval_causal(
+        net=net,
+        eval_batchsize=eval_batchsize,
+        num_eval_steps=num_eval_steps,
+    )
 
-            # TODO: Test on different masking-rate-combinations
-            #   ((0.25, 0.1), (0.5, 0.1), (0.75, 0.1), (0.25, 0.0), (0.5, 0.0), (0.75, 0.0)) etc.
-            #   The 0.0 for the acting_rate means that a single token is acted upon.
-            inputs, targets = get_planning_data(sequence, masking_rate=0.25)
-            outputs = net(inputs)
-            val_loss_planning += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
+    first_acting_token_idx, last_acting_token_idx = get_first_and_last_acting_token_idx(
+        seq_len=max_sequence_length,
+        planning_rate=0.25,
+        acting_rate=0.01,
+    )
+    (
+        val_loss_planning, val_acc_planning, val_pplx_planning,
+        val_loss_acting_full, val_acc_acting_full, val_pplx_acting_full,
+        _, _, _, _, _, _, _, _, _,
+    ) = _eval_plan_act(
+        net=net,
+        eval_batchsize=eval_batchsize,
+        num_eval_steps=num_eval_steps,
+        first_acting_token_idx=first_acting_token_idx,
+        last_acting_token_idx=last_acting_token_idx,
+        top_k=5
+    )
 
-            inputs, targets = get_acting_data(net, sequence, outputs, planning_rate=0.25, acting_rate=0.1, top_k=5)
-            outputs = net(inputs)
-            val_loss_acting += 1./num_eval_steps * loss_fn(outputs.flatten(0, 1).float(), targets.flatten(0, 1))
-
-        val_pplx = calc_pplx(val_loss)
-        val_pplx_planning = calc_pplx(val_loss_planning)
-        val_pplx_acting = calc_pplx(val_loss_acting)
+    net.train()
 
     return (
-        val_acc.item(), val_loss.item(), val_pplx.item(),
-        val_loss_planning.item(), val_pplx_planning.item(),
-        val_loss_acting.item(), val_pplx_acting.item(),
+        causal_loss, causal_acc, causal_pplx,
+        val_loss_planning, val_acc_planning, val_pplx_planning,
+        val_loss_acting_full, val_acc_acting_full, val_pplx_acting_full,
     )
+
+
+@torch.no_grad()
+def full_evaluation(net: SpeedyLangNet):
+    net.eval()
+    
+    eval_batchsize           = max(math.floor(tokens_per_batch_capacity/(hyp['misc']['sequence_length']['max'])//16), 1) # Number of sequences per batch relative to the max-length batchsize capacity, downscale factor hardcoded to help prevent OOMs. Tunable
+    num_eval_sequences       = hyp['opt']['num_eval_tokens']//hyp['misc']['sequence_length']['max']
+    num_eval_steps           = num_eval_sequences//eval_batchsize
+
+    causal_loss, causal_acc, causal_pplx = _eval_causal(
+        net=net,
+        eval_batchsize=eval_batchsize,
+        num_eval_steps=num_eval_steps,
+    )
+    results = {
+        "setting": ["causal"], 
+        "loss": [causal_loss], 
+        "acc": [causal_acc], 
+        "pplx": [causal_pplx],
+        "loss_planning": [None],
+        "acc_planning": [None],
+        "pplx_planning": [None],
+        "loss_acting_full": [None],
+        "acc_acting_full": [None],
+        "pplx_acting_full": [None],
+        "loss_acting_causal": [None],
+        "acc_acting_causal": [None],
+        "pplx_acting_causal": [None],
+        "loss_acting_acting": [None],
+        "acc_acting_acting": [None],
+        "pplx_acting_acting": [None],
+        "loss_acting_planning": [None],
+        "acc_acting_planning": [None],
+        "pplx_acting_planning": [None],
+    }
+    
+    acting_mask_widths = range(1, 11)
+    last_acting_token_indices = range(13, max_sequence_length, step=10)
+    top_ks = [1, 2, 3, 4, 5]
+
+    for acting_mask_width, last_acting_token_idx, top_k in itertools.product(
+        acting_mask_widths, last_acting_token_indices, top_ks
+    ):
+        first_acting_token_idx = last_acting_token_idx - acting_mask_width
+
+        (
+            val_loss_planning, val_acc_planning, val_pplx_planning,
+            val_loss_acting_full, val_acc_acting_full, val_pplx_acting_full,
+            val_loss_acting_causal, val_acc_acting_causal, val_pplx_acting_causal,
+            val_loss_acting_acting, val_acc_acting_acting, val_pplx_acting_acting,
+            val_loss_acting_planning, val_acc_acting_planning, val_pplx_acting_planning,
+        ) = _eval_plan_act(
+            net=net,
+            eval_batchsize=eval_batchsize,
+            num_eval_steps=num_eval_steps,
+            first_acting_token_idx=first_acting_token_idx,
+            last_acting_token_idx=last_acting_token_idx,
+            top_k=top_k
+        )
+
+        results["setting"].append(str((first_acting_token_idx, last_acting_token_idx)))
+        results["loss"].append(None)
+        results["acc"].append(None)
+        results["pplx"].append(None)
+        results["loss_planning"].append(val_loss_planning)
+        results["acc_planning"].append(val_acc_planning)
+        results["pplx_planning"].append(val_pplx_planning)
+        results["loss_acting_full"].append(val_loss_acting_full)
+        results["acc_acting_full"].append(val_acc_acting_full)
+        results["pplx_acting_full"].append(val_pplx_acting_full)
+        results["loss_acting_causal"].append(val_loss_acting_causal)
+        results["acc_acting_causal"].append(val_acc_acting_causal)
+        results["pplx_acting_causal"].append(val_pplx_acting_causal)
+        results["loss_acting_acting"].append(val_loss_acting_acting)
+        results["acc_acting_acting"].append(val_acc_acting_acting)
+        results["pplx_acting_acting"].append(val_pplx_acting_acting)
+        results["loss_acting_planning"].append(val_loss_acting_planning)
+        results["acc_acting_planning"].append(val_acc_acting_planning)
+        results["pplx_acting_planning"].append(val_pplx_acting_planning)
+
+    net.train()
+    return results
 
 
 def train(net: SpeedyLangNet | None = None, **settings):
@@ -655,20 +825,25 @@ def train(net: SpeedyLangNet | None = None, **settings):
     net = net or make_net(settings)
 
     # Init wandb 
+    # TODO: update run name with the new options
+    # TODO: use same run name for full eval at the end
     if settings['log_wandb']:
-        run_name = f"depth_{settings['depth']}_width_{settings['width']}_seed_{settings['seed']}"
-        if settings['plan_act']:
-            run_name = (
-                "plan-act_loss-dividers-C-P-A_"
-                f"{settings['causal_divider']}-{settings['planning_divider']}"
-                f"-{settings['acting_divider']}_"
-            ) + run_name
-
         wandb.finish()  # Finish any previous runs
         wandb.init(
             project=settings['wandb_project'], 
             config=settings,
-            name=run_name,
+            name=get_run_name(
+                depth=settings['depth'],
+                width=settings['width'],
+                num_heads=settings['num_heads'],
+                linear_value=settings['linear_value'],
+                plan_act=settings['plan_act'],
+                causal_divider=settings['causal_divider'],
+                planning_divider=settings['planning_divider'],
+                acting_divider=settings['acting_divider'],
+                randomize_masking_rates=settings['randomize_masking_rates'],
+                top_k=settings['top_k']
+            ),
         )
 
     # Full-run statistics variables
@@ -732,9 +907,9 @@ def train(net: SpeedyLangNet | None = None, **settings):
     scheduler         = torch.optim.lr_scheduler.LambdaLR(opt, [k['scheduler'] for k in param_groups_dict.values()])
 
     # Save some results
-    train_losses, val_losses_causal, train_accs, val_accs, train_pplxs, val_pplxs_causal = [], [], [], [], [], []
-    val_losses_planning, val_pplxs_planning = [], []
-    val_losses_acting, val_pplxs_acting = [], []
+    train_losses, val_losses_causal, train_accs, val_accs_causal, train_pplxs, val_pplxs_causal = [], [], [], [], [], []
+    val_losses_planning, val_accs_planning, val_pplxs_planning = [], [], []
+    val_losses_acting, val_accs_acting, val_pplxs_acting = [], [], []
     grad_norms, cumulative_time = [], []
     tokens_seen_list, epochs_list = [], []
     batch_sizes = []
@@ -770,26 +945,36 @@ def train(net: SpeedyLangNet | None = None, **settings):
                 actor_masking_rate = randomize_masking_rate(actor_masking_rate)
             actor_masking_rate = min(actor_masking_rate, planner_masking_rate - (1.1/curr_length))  # at least 1 token less than the planner
 
-            inputs, targets = get_planning_data(sequence, masking_rate=planner_masking_rate)
-            outputs = net(inputs,)
+            first_acting_token_idx, last_acting_token_idx = get_first_and_last_acting_token_idx(
+                seq_len=curr_length,
+                planning_rate=planner_masking_rate,
+                acting_rate=actor_masking_rate,
+            )
+
+            inputs, targets = get_planning_data(sequence, first_acting_token_idx=first_acting_token_idx)
+            outputs = net(inputs)
             loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["planning_divider"]
             loss.div(discrete_sampled_microbatch_steps).backward(retain_graph=True)
 
             inputs, targets = get_acting_data(
                 net, sequence, outputs,
-                planning_rate=planner_masking_rate,
-                acting_rate=actor_masking_rate,
+                first_acting_token_idx=first_acting_token_idx,
+                last_acting_token_idx=last_acting_token_idx,
                 top_k=settings['top_k'],
             )
-            outputs = net(inputs)
+            outputs = net(
+                inputs, 
+                first_acting_token_idx=first_acting_token_idx,
+                last_acting_token_idx=last_acting_token_idx,
+            )
             loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["acting_divider"]
-            loss.div(discrete_sampled_microbatch_steps).backward(retain_graph=True)
-        
-        inputs, targets = get_causal_data(sequence)
-        outputs = net(inputs, mode='causal')
-        loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) * settings["causal_divider"]
+            loss.div(discrete_sampled_microbatch_steps).backward()
+        else:
+            inputs, targets = get_causal_data(sequence)
+            outputs = net(inputs)
+            loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) * settings["causal_divider"]
+            loss.div(discrete_sampled_microbatch_steps).backward()
 
-        loss.div(discrete_sampled_microbatch_steps).backward()
         tokens_seen += curr_batchsize * curr_length
         epoch = tokens_seen/len(data['train'])
 
@@ -870,19 +1055,20 @@ def train(net: SpeedyLangNet | None = None, **settings):
             t_secs += 1e-3 * starter.elapsed_time(ender)
             train_loss = loss.detach().cpu().item() # Update the loss for the training details printout
 
-            net.eval()
             (
                 val_acc, val_loss_causal, val_pplx,
-                val_loss_planning, val_pplx_planning,
-                val_loss_acting, val_pplx_acting,
-            ) = eval(net)
+                val_loss_planning, val_acc_planning, val_pplx_planning,
+                val_loss_acting, val_acc_acting, val_pplx_acting,
+            ) = quick_evaluation(net)
 
             val_losses_causal.append(val_loss_causal)
-            val_accs.append(val_acc)
+            val_accs_causal.append(val_acc)
             val_pplxs_causal.append(val_pplx)
             val_losses_planning.append(val_loss_planning)
+            val_accs_planning.append(val_acc_planning)
             val_pplxs_planning.append(val_pplx_planning)
             val_losses_acting.append(val_loss_acting)
+            val_accs_acting.append(val_acc_acting)
             val_pplxs_acting.append(val_pplx_acting)
             
             
@@ -895,8 +1081,10 @@ def train(net: SpeedyLangNet | None = None, **settings):
                     'val/acc/causal': val_acc, 
                     'val/pplx/causal': val_pplx,
                     'val/loss/planning': val_loss_planning,
+                    'val/acc/planning': val_acc_planning,
                     'val/pplx/planning': val_pplx_planning,
                     'val/loss/acting': val_loss_acting,
+                    'val/acc/acting': val_acc_acting,
                     'val/pplx/acting': val_pplx_acting,
                     'tokens_seen': tokens_seen, 
                     'epoch': epoch,
@@ -921,9 +1109,9 @@ def train(net: SpeedyLangNet | None = None, **settings):
     return (
         net, val_loss_causal,
         train_losses, train_pplxs, train_accs,
-        val_losses_causal, val_pplxs_causal, val_accs,
-        val_losses_planning, val_pplxs_planning,
-        val_losses_acting, val_pplxs_acting,
+        val_losses_causal, val_accs_causal, val_pplxs_causal,
+        val_losses_planning, val_accs_planning, val_pplxs_planning,
+        val_losses_acting, val_accs_acting, val_pplxs_acting,
         grad_norms, cumulative_time, 
         tokens_seen_list, epochs_list,
         batch_sizes, sequence_lengths, learning_rates, weight_decays,
@@ -1219,6 +1407,34 @@ def print_settings(settings: list[tuple], names: list[str] = None):
         print(f"Setting {i+1}/{len(settings)}:\n{named_settings}\n\n")
 
 
+def get_run_name(
+        depth: int,
+        width: int,
+        seed: int,
+        num_heads: int,
+        linear_value: bool,
+        plan_act: bool,
+        causal_divider: float,
+        planning_divider: float,
+        acting_divider: float,
+        randomize_masking_rates: bool,
+        top_k: int,
+):
+    run_name = f"depth_{depth}_width_{width}_seed_{seed}_num_heads_{num_heads}"
+    if linear_value:
+        run_name = "linear_value_" + run_name
+    if plan_act:
+        if randomize_masking_rates:
+            run_name = "randomize_masking_rates_" + run_name
+        run_name = (
+            "plan-act_loss-dividers-C-P-A_"
+            f"{causal_divider}-{planning_divider}-{acting_divider}_"
+            f"top_k_{top_k}"
+        ) + run_name
+
+    return run_name
+
+
 def main():
     args = get_args()
     settings = get_settings(args)
@@ -1228,6 +1444,7 @@ def main():
             settings, names=[
                 "model_scale", "depth", "width", "num_heads", "linear_value",
                 "plan_act", "causal_divider", "planning_divider", "acting_divider",
+                "randomize_masking_rate", "top_k",
             ]
         )
         proceed = input("Proceed? [y/n] ")
@@ -1260,13 +1477,14 @@ def main():
                 f"\n:::    {width=}"
                 f"\n:::    num_params={format_num_params(num_params)}"
                 f"\n:::    num_non_embedding_params={format_num_params(num_non_embedding_params)}"
-                f"\n:::    ul2={args.ul2}"
-                f"\n:::    causal_denoisers={args.causal_denoisers}"
+                f"\n:::    plan_act={args.plan_act}"
                 f"\n:::    {causal_divider=}"
                 f"\n:::    {planning_divider=}"
                 f"\n:::    {acting_divider=}"
-                f"\n:::    randomize_denoiser_settings={args.randomize_denoiser_settings}"
-                f"\n:::    randomize_mask_width={args.randomize_mask_width}"
+                f"\n:::    planner_masking_rate={args.planner_masking_rate}"
+                f"\n:::    actor_masking_rate={args.actor_masking_rate}"
+                f"\n:::    randomize_masking_rate={args.randomize_masking_rate}"
+                f"\n:::    top_k={args.top_k}"
             )
             max_len = max(len(line) for line in title.split("\n"))
             title = "\n".join([line + " " * (max_len - len(line)) + " :::" for line in title.split("\n")])
@@ -1282,9 +1500,9 @@ def main():
             (
                 net, last_val_loss,
                 train_losses, train_pplxs, train_accs,
-                val_losses_causal, val_pplxs_causal, val_accs_causal,
-                val_losses_planning, val_pplxs_planning,
-                val_losses_acting, val_pplxs_acting,
+                val_losses_causal, val_accs_causal, val_pplxs_causal,
+                val_losses_planning, val_accs_planning, val_pplxs_planning,
+                val_losses_acting, val_accs_acting, val_pplxs_acting,
                 grad_norms, cumulative_times,
                 tokens_seen_list, epochs_list,
                 batch_sizes, sequence_lengths, learning_rates, weight_decays,
@@ -1315,7 +1533,28 @@ def main():
                 acting_divider=acting_divider,
                 randomize_masking_rate=args.randomize_masking_rate,
                 top_k=args.top_k,
+                plan_act=args.plan_act,
             )
+
+            # TODO: if args.plan_act, do a full evaluation here; save it; save reference to it in results
+            if args.plan_act:
+                full_eval_results = full_evaluation(net)
+                os.makedirs("results/full_evaluations", exist_ok=True)
+                full_eval_path = "results/full_evaluations/" + get_run_name(
+                    depth=depth,
+                    width=width,
+                    num_heads=num_heads,
+                    linear_value=linear_value,
+                    plan_act=args.plan_act,
+                    causal_divider=causal_divider,
+                    planning_divider=planning_divider,
+                    acting_divider=acting_divider,
+                    randomize_masking_rates=args.randomize_masking_rates,
+                    top_k=args.top_k,
+                ) + ".csv"
+                pl.DataFrame(full_eval_results).write_csv(full_eval_path)
+            else:
+                full_eval_path = None
 
             # You can do whatever you want with your net here; I delete it to save VRAM
             del net 
@@ -1350,11 +1589,13 @@ def main():
                 "train_pplx": [str(train_pplxs)],
                 "train_acc": [str(train_accs)],
                 "val_loss_causal": [str(val_losses_causal)],
-                "val_pplx_causal": [str(val_pplxs_causal)],
                 "val_acc_causal": [str(val_accs_causal)],
+                "val_pplx_causal": [str(val_pplxs_causal)],
                 "val_loss_planning": [str(val_losses_planning)],
+                "val_acc_planning": [str(val_accs_planning)],
                 "val_pplx_planning": [str(val_pplxs_planning)],
                 "val_loss_acting": [str(val_losses_acting)],
+                "val_acc_acting": [str(val_accs_acting)],
                 "val_pplx_acting": [str(val_pplxs_acting)],
                 "grad_norm": [str(grad_norms)],
                 "cumulative_time": [str(cumulative_times)],
@@ -1364,6 +1605,7 @@ def main():
                 "seq_length": [str(sequence_lengths)],
                 "learning_rate": [str(learning_rates)],
                 "weight_decay": [str(weight_decays)],
+                "full_evaluation_file": [full_eval_path],
             }
             df = pl.DataFrame(results)
 
