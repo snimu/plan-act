@@ -838,10 +838,9 @@ def train(net: SpeedyLangNet | None = None, **settings):
                 num_heads=settings['num_heads'],
                 linear_value=settings['linear_value'],
                 plan_act=settings['plan_act'],
-                causal_divider=settings['causal_divider'],
                 planning_divider=settings['planning_divider'],
                 acting_divider=settings['acting_divider'],
-                randomize_masking_rates=settings['randomize_masking_rates'],
+                randomize_masking_rate=settings['randomize_masking_rate'],
                 top_k=settings['top_k']
             ),
         )
@@ -940,7 +939,7 @@ def train(net: SpeedyLangNet | None = None, **settings):
             planner_masking_rate = settings['planner_masking_rate']
             actor_masking_rate = settings['actor_masking_rate']
 
-            if settings['randomize_masking_rates']:
+            if settings['randomize_masking_rate']:
                 planner_masking_rate = randomize_masking_rate(planner_masking_rate)
                 actor_masking_rate = randomize_masking_rate(actor_masking_rate)
             actor_masking_rate = min(actor_masking_rate, planner_masking_rate - (1.1/curr_length))  # at least 1 token less than the planner
@@ -972,7 +971,7 @@ def train(net: SpeedyLangNet | None = None, **settings):
         else:
             inputs, targets = get_causal_data(sequence)
             outputs = net(inputs)
-            loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) * settings["causal_divider"]
+            loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1))
             loss.div(discrete_sampled_microbatch_steps).backward()
 
         tokens_seen += curr_batchsize * curr_length
@@ -1268,11 +1267,6 @@ def get_args() -> argparse.Namespace:
         help="Use the plan-act task during training. FLAG"
     )
     parser.add_argument(
-        "--causal_divider",
-        type=float, default=1.0, nargs="+",
-        help="Divider for the causal loss. TYPE: float; DEFAULT: 0.5"
-    )
-    parser.add_argument(
         "--planning_divider",
         type=float, default=6.0, nargs="+",
         help="Divider for the planning loss. TYPE: float; DEFAULT: 6.0"
@@ -1302,7 +1296,7 @@ def get_args() -> argparse.Namespace:
         help="Masking rate for the acting task. TYPE: float; DEFAULT: 0.1"
     )
     parser.add_argument(
-        "--randomize_masking_rates",
+        "--randomize_masking_rate",
         action="store_true",
         help="If this flag is set, the masking rates will be randomized "
         "using a Beta-distribution with concentration=8 around the given masking rates. "
@@ -1318,14 +1312,11 @@ def get_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     # CHECK & PREPROCESS ARGS
-    args.causal_divider = 1.0 if not args.ul2 else args.causal_divider
-
     args.depth = [args.depth] if isinstance(args.depth, int) else args.depth
     args.width = [args.width] if isinstance(args.width, int) else args.width
     args.depth = [None if d < 1 else d for d in args.depth]
     args.width = [None if w < 1 else w for w in args.width]
     args.num_heads = [args.num_heads] if isinstance(args.num_heads, int) else args.num_heads
-    args.causal_divider = [args.causal_divider] if isinstance(args.causal_divider, float) else args.causal_divider
     args.planning_divider = [args.planning_divider] if isinstance(args.planning_divider, float) else args.planning_divider
     args.acting_divider = [args.acting_divider] if isinstance(args.acting_divider, float) else args.acting_divider
 
@@ -1333,7 +1324,7 @@ def get_args() -> argparse.Namespace:
     args.linear_value = [args.linear_value] if isinstance(args.linear_value, int) else args.linear_value
     args.linear_value = list(set([bool(v) for v in args.linear_value]))
 
-    if args.loss_divider_method == "zip" and not all(len(l) == len(args.causal_divider) for l in [args.planning_divider, args.acting_divider]):
+    if args.plan_act and args.loss_divider_method == "zip" and len(args.planning_divider) != len(args.acting_divider):
         raise ValueError("If loss_divider_method is 'zip', all dividers must have the same length.")
 
     if any(d is None or w is None for d in args.depth for w in args.width):
@@ -1372,19 +1363,19 @@ def get_settings(args: argparse.Namespace) -> list:
 
     if args.plan_act and args.loss_divider_method == "product":
         settings_loss_dividers = list(itertools.product(
-            args.causal_divider, args.planning_divider, args.acting_divider,
+            args.planning_divider, args.acting_divider,
         )) 
     elif args.plan_act and args.loss_divider_method == "zip":
         settings_loss_dividers = list(zip(
-            args.causal_divider, args.planning_divider, args.acting_divider, strict=True)
+            args.planning_divider, args.acting_divider, strict=True)
         )
-    elif not args.ul2:
-        settings_loss_dividers = [(1., 0., 0.)]
+    elif not args.plan_act:
+        settings_loss_dividers = [(0., 0.)]
 
     settings = [
-        (model_scale, depth, width, num_heads, linear_value, causal_divider, planning_divider, acting_divider) 
+        (model_scale, depth, width, num_heads, linear_value, planning_divider, acting_divider) 
         for model_scale, depth, width, num_heads, linear_value in settings 
-        for causal_divider, planning_divider, acting_divider in settings_loss_dividers
+        for planning_divider, acting_divider in settings_loss_dividers
         if not setting_violates_rules(
             model_scale=model_scale, 
             depth=depth, 
@@ -1414,21 +1405,20 @@ def get_run_name(
         num_heads: int,
         linear_value: bool,
         plan_act: bool,
-        causal_divider: float,
         planning_divider: float,
         acting_divider: float,
-        randomize_masking_rates: bool,
+        randomize_masking_rate: bool,
         top_k: int,
 ):
     run_name = f"depth_{depth}_width_{width}_seed_{seed}_num_heads_{num_heads}"
     if linear_value:
         run_name = "linear_value_" + run_name
     if plan_act:
-        if randomize_masking_rates:
-            run_name = "randomize_masking_rates_" + run_name
+        if randomize_masking_rate:
+            run_name = "randomize_masking_rate_" + run_name
         run_name = (
-            "plan-act_loss-dividers-C-P-A_"
-            f"{causal_divider}-{planning_divider}-{acting_divider}_"
+            "plan-act_loss-dividers-P-A_"
+            f"{planning_divider}-{acting_divider}_"
             f"top_k_{top_k}"
         ) + run_name
 
@@ -1443,7 +1433,7 @@ def main():
         print_settings(
             settings, names=[
                 "model_scale", "depth", "width", "num_heads", "linear_value",
-                "plan_act", "causal_divider", "planning_divider", "acting_divider",
+                "plan_act", "planning_divider", "acting_divider",
                 "randomize_masking_rate", "top_k",
             ]
         )
@@ -1458,7 +1448,7 @@ def main():
     global hyp, model_scale
     change_gpu_token_capacity(args.gpu_capacity_scalar)
 
-    for setting_num, (model_scale, depth, width, num_heads, linear_value, causal_divider, planning_divider, acting_divider) in enumerate(settings):
+    for setting_num, (model_scale, depth, width, num_heads, linear_value, planning_divider, acting_divider) in enumerate(settings):
         seed = args.seed  # reset seed so that every setting goes through the same seeds over the different runs
 
         # Change the model scale; width is rounded to nearest 64, and both are None if scaled by model_scale -> get depth and width here
@@ -1478,7 +1468,6 @@ def main():
                 f"\n:::    num_params={format_num_params(num_params)}"
                 f"\n:::    num_non_embedding_params={format_num_params(num_non_embedding_params)}"
                 f"\n:::    plan_act={args.plan_act}"
-                f"\n:::    {causal_divider=}"
                 f"\n:::    {planning_divider=}"
                 f"\n:::    {acting_divider=}"
                 f"\n:::    planner_masking_rate={args.planner_masking_rate}"
@@ -1526,14 +1515,13 @@ def main():
                 tokens_per_batch_capacity=tokens_per_batch_capacity,
                 max_sequence_length=max_sequence_length,
                 seed=seed,
-                ul2=args.ul2,
-                causal_denoisers=args.causal_denoisers,
-                causal_divider=causal_divider,
+                plan_act=args.plan_act,
                 planning_divider=planning_divider,
                 acting_divider=acting_divider,
                 randomize_masking_rate=args.randomize_masking_rate,
                 top_k=args.top_k,
-                plan_act=args.plan_act,
+                planner_masking_rate=args.planner_masking_rate,
+                actor_masking_rate=args.actor_masking_rate,
             )
 
             # TODO: if args.plan_act, do a full evaluation here; save it; save reference to it in results
@@ -1546,10 +1534,9 @@ def main():
                     num_heads=num_heads,
                     linear_value=linear_value,
                     plan_act=args.plan_act,
-                    causal_divider=causal_divider,
                     planning_divider=planning_divider,
                     acting_divider=acting_divider,
-                    randomize_masking_rates=args.randomize_masking_rates,
+                    randomize_masking_rate=args.randomize_masking_rate,
                     top_k=args.top_k,
                 ) + ".csv"
                 pl.DataFrame(full_eval_results).write_csv(full_eval_path)
@@ -1562,9 +1549,7 @@ def main():
             # Save results
             results = {
                 "last_val_loss": [last_val_loss],
-                "ul2": [args.ul2],
-                "causal_denoisers": [args.causal_denoisers],
-                "causal_divider": [causal_divider],
+                "plan_act": [args.plan_act],
                 "planning_divider": [planning_divider],
                 "acting_divider": [acting_divider],
                 "randomize_masking_rate": [args.randomize_masking_rate],
