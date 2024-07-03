@@ -330,7 +330,7 @@ class SpeedyLangNet(nn.Module):
         super().__init__()
         self.net_dict = network_dict
 
-    def embed(self, x) -> torch.Tensor:
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
         return self.net_dict['embedding'](x)
 
     def forward(self, x):
@@ -435,12 +435,14 @@ def get_acting_data(
 
 
 @torch.no_grad()
-def recombine_outputs(net: SpeedyLangNet, planning_output: torch.Tensor, top_k: int) -> torch.Tensor:
-    sorted = torch.sort(planning_output, dim=-1, descending=True)
-    sorted_tokens = sorted.indices[:, :top_k]
-    embeddings = net.embed(sorted_tokens)
-    embeddings = torch.sum(embeddings * sorted.values[:, :top_k].unsqueeze(-1), dim=1)
-    return embeddings
+def recombine_outputs(embedding: nn.Embedding, planning_output: torch.Tensor, top_k: int) -> torch.Tensor:
+    planning_output.grad = None
+    values, indices = torch.topk(planning_output, k=top_k, dim=-1)
+    normalized_values = values / values.sum(dim=-1, keepdim=True)
+    embedded = embedding(indices)  # shape: (batch_size, top_k, embedding_dim)
+    weighted = embedded * normalized_values.unsqueeze(-1)  # shape: (batch_size, top_k, embedding_dim)
+    result = weighted.sum(dim=1)  # shape: (batch_size, embedding_dim)
+    return result
 
 
 def randomize_masking_rate(mean: float, concentration: int = 8) -> float:
