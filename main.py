@@ -427,21 +427,22 @@ def get_acting_data(
     ).copy_(sequence)
 
     inputs = sequence.roll(1, dims=-1)
-    inputs[:, last_acting_token_idx:] = recombine_outputs(net, planning_output[:, last_acting_token_idx:], top_k)
     inputs[:, first_acting_token_idx:last_acting_token_idx] = hyp['misc']['acting_token']
     inputs[:, 0] = hyp['misc']['acting_token']
+    inputs = net.embed(inputs)
+    inputs[:, last_acting_token_idx:] = recombine_outputs(net, planning_output[:, last_acting_token_idx:], top_k)
 
     return inputs, targets
 
 
 @torch.no_grad()
-def recombine_outputs(embedding: nn.Embedding, planning_output: torch.Tensor, top_k: int) -> torch.Tensor:
+def recombine_outputs(net: SpeedyLangNet, planning_output: torch.Tensor, top_k: int) -> torch.Tensor:
     planning_output.grad = None
     values, indices = torch.topk(planning_output, k=top_k, dim=-1)
     normalized_values = values / values.sum(dim=-1, keepdim=True)
-    embedded = embedding(indices)  # shape: (batch_size, top_k, embedding_dim)
-    weighted = embedded * normalized_values.unsqueeze(-1)  # shape: (batch_size, top_k, embedding_dim)
-    result = weighted.sum(dim=1)  # shape: (batch_size, embedding_dim)
+    embedded = net.embed(indices)
+    weighted = embedded * normalized_values.unsqueeze(-1)
+    result = weighted.sum(dim=-2)
     return result
 
 
