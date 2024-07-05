@@ -388,7 +388,7 @@ def get_batch(data_dict, key, batchsize, length):
 
 @torch.no_grad()
 def get_causal_data(sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    targets  = sequence
+    targets  = torch.empty_like(sequence).copy_(sequence)
 
     # Inputs: add special token to beginning
     # Just roll the tensor and replace the first (previously final) token to get the causality going
