@@ -540,7 +540,7 @@ def grow_sequence_length(old_length, old_batchsize):
 #          Logging           #
 ##############################
 
-variables_to_log = ['epoch', 'curr_step', 'train_loss', 'val_loss_causal', 'val_loss_s', 'val_loss_x', 'val_loss_r', 't_secs']
+variables_to_log = ['epoch', 'curr_step', 'train_loss', 'val_loss_causal', 'val_loss_planning', 'val_loss_acting']
 # define the printing function and print the column heads
 def print_training_details(columns_list, separator_left='  ', separator_right='  |', column_labels_only=False, is_final_entry=False):
     output_line = "|" # start with the left bar
