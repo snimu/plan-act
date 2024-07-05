@@ -1270,13 +1270,13 @@ def get_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--planning_divider",
-        type=float, default=6.0, nargs="+",
-        help="Divider for the planning loss. TYPE: float; DEFAULT: 6.0"
+        type=float, default=2.0, nargs="+",
+        help="Divider for the planning loss. TYPE: float; DEFAULT: 2.0"
     )
     parser.add_argument(
         "--acting_divider",
-        type=float, default=6.0, nargs="+",
-        help="Divider for the acting loss. TYPE: float; DEFAULT: 6.0"
+        type=float, default=2.0, nargs="+",
+        help="Divider for the acting loss. TYPE: float; DEFAULT: 2.0"
     )
     parser.add_argument(
         "--loss_divider_method",
