@@ -254,7 +254,7 @@ class LatentAttentionBlock(nn.Module):
 
     def make_mask(
             self, 
-            x, 
+            x: torch.Tensor, 
             first_acting_token_idx: int | None = None,
             last_acting_token_idx: int | None = None,
     ):
@@ -277,7 +277,7 @@ class LatentAttentionBlock(nn.Module):
 
     def forward(
             self, 
-            x, 
+            x: torch.Tensor, 
             first_acting_token_idx: int | None = None,
             last_acting_token_idx: int | None = None,
     ):
@@ -333,11 +333,16 @@ class SpeedyLangNet(nn.Module):
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         return self.net_dict['embedding'](x)
 
-    def forward(self, x):
+    def forward(
+            self, 
+            x: torch.Tensor,
+            first_acting_token_idx: int | None = None,
+            last_acting_token_idx: int | None = None,
+    ):
         if x.dtype == torch.int64:
             x = self.embed(x)
         for attn_block in self.net_dict['attn_layers']:
-            x = attn_block(x) # note: residuals are included in the block definitions for these layers
+            x = attn_block(x, first_acting_token_idx, last_acting_token_idx)
         x = self.net_dict['norm'](x)
         x = self.net_dict['outputs'](x)
         return x
@@ -671,8 +676,8 @@ def _eval_plan_act(
             == targets[:, first_acting_token_idx:last_acting_token_idx]
         ).float().mean()
         val_loss_acting_planning += 1./num_eval_steps * loss_fn(
-            outputs.flatten(0, 1)[:, last_acting_token_idx:].float(), 
-            targets.flatten(0, 1)[:, last_acting_token_idx:],
+            outputs[:, last_acting_token_idx:].flatten(0, 1).float(), 
+            targets[:, last_acting_token_idx:].flatten(0, 1),
         )
         val_acc_acting_planning += 1./num_eval_steps * (
             outputs.argmax(-1)[:, last_acting_token_idx:]
