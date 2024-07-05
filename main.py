@@ -960,8 +960,7 @@ def train(net: SpeedyLangNet | None = None, **settings):
 
             inputs, targets = get_planning_data(sequence, first_acting_token_idx=first_acting_token_idx)
             outputs = net(inputs)
-            loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["planning_divider"]
-            loss.div(discrete_sampled_microbatch_steps).backward(retain_graph=True)
+            loss_planning = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["planning_divider"]
 
             inputs, targets = get_acting_data(
                 net, sequence, outputs,
@@ -974,7 +973,9 @@ def train(net: SpeedyLangNet | None = None, **settings):
                 first_acting_token_idx=first_acting_token_idx,
                 last_acting_token_idx=last_acting_token_idx,
             )
-            loss = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["acting_divider"]
+            loss_acting = loss_fn(outputs.flatten(0, 1), targets.flatten(0, 1)) / settings["acting_divider"]
+
+            loss = loss_planning + loss_acting
             loss.div(discrete_sampled_microbatch_steps).backward()
         else:
             inputs, targets = get_causal_data(sequence)
